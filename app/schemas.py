@@ -603,6 +603,87 @@ class UnitSetAliasListResponse(BaseModel):
     )
 
 
+#: 迁移包的格式标识与格式版本（导出/导入双方据此识别与兼容）。
+MIGRATION_PACKAGE_KIND = "unit-api.custom-unit-set-migration"
+MIGRATION_PACKAGE_VERSION = 1
+
+
+class UnitSetMigrationExportRequest(BaseModel):
+    """POST /custom-unit-set-migration/export 请求体：1～6 个已发布定义集标识。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    custom_unit_set_ids: list[str] = Field(
+        min_length=1,
+        max_length=6,
+        description="要导出的已发布定义集标识（1～6 个，不可重复）；"
+        "任一不存在或重复时整次请求返回 422",
+    )
+
+
+class UnitSetMigrationPackage(BaseModel):
+    """实例间迁移包：1～6 个定义集 + 指向它们的活动别名。
+
+    导出响应即本模型，可原样作为导入请求体交给另一实例。``sets`` 的键为
+    **源实例标识**（导入时不沿用，仅用于包内引用与响应映射）；``aliases``
+    的值必须是 ``sets`` 中存在的键，悬空引用整包拒绝。
+    """
+
+    kind: Literal[MIGRATION_PACKAGE_KIND] = Field(
+        default=MIGRATION_PACKAGE_KIND,
+        description="迁移包格式标识，用于识别包类型",
+    )
+    version: Literal[MIGRATION_PACKAGE_VERSION] = Field(
+        default=MIGRATION_PACKAGE_VERSION, description="迁移包格式版本"
+    )
+    sets: dict[str, list[CustomUnitItem]] = Field(
+        min_length=1,
+        max_length=6,
+        description="包内定义集：键为源实例的定义集标识（1～6 个、互不重复）；"
+        "各定义集均按发布时相同的规则在导入端重新校验",
+    )
+    aliases: dict[str, str] = Field(
+        default_factory=dict,
+        description="导出时指向包内定义集的活动别名：键为别名，值为 sets 中"
+        "的源实例标识；导入后改指目标实例生成的新标识。目标端已有同名别名"
+        "或引用悬空时整包拒绝",
+    )
+
+    @field_validator("sets")
+    @classmethod
+    def _check_set_id_keys(cls, sets: dict[str, list[CustomUnitItem]]) -> dict:
+        for set_id in sets:
+            if not 1 <= len(set_id) <= 64:
+                raise ValueError("定义集标识长度须在 1～64 之间")
+        return sets
+
+    @field_validator("aliases")
+    @classmethod
+    def _check_alias_keys_and_targets(cls, aliases: dict[str, str]) -> dict[str, str]:
+        for alias in aliases:
+            if not re.match(ALIAS_NAME_PATTERN, alias):
+                raise ValueError(
+                    f"别名 {alias!r} 不合法：仅允许字母、数字、下划线与连字符，"
+                    "长度 1～64"
+                )
+        for alias, target in aliases.items():
+            if not 1 <= len(target) <= 64:
+                raise ValueError(f"别名 {alias!r} 的目标标识长度须在 1～64 之间")
+        return aliases
+
+
+class UnitSetMigrationImportResponse(BaseModel):
+    """POST /custom-unit-set-migration/import 的成功响应。"""
+
+    package: UnitSetMigrationPackage = Field(description="实际导入的迁移包（回显）")
+    id_map: dict[str, str] = Field(
+        description="源实例旧标识 -> 目标实例新生成的本地标识（按旧标识排序）"
+    )
+    aliases: list[UnitSetAliasInfo] = Field(
+        description="导入后建立的活动别名及其指向的新标识（按别名排序）"
+    )
+
+
 class ErrorDetail(BaseModel):
     error: str = Field(description="机器可读错误码")
     message: str = Field(description="人类可读错误信息")

@@ -33,6 +33,9 @@ from .schemas import (
     SolveRequest,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
+    UnitSetMigrationExportRequest,
+    UnitSetMigrationImportResponse,
+    UnitSetMigrationPackage,
     WorksheetDiagnoseRequest,
     WorksheetDiagnoseResponse,
     WorksheetMigrateRequest,
@@ -71,6 +74,10 @@ app = FastAPI(
         "物理量相同的精确十进制值，返回可直接交给 /worksheet 的新工作单。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
         "再由四个接口凭标识选用。"
+        "POST /custom-unit-set-migration/export 可一次导出 1～6 个已发布"
+        "定义集及指向它们的活动别名作为迁移包，另一实例用 "
+        "POST /custom-unit-set-migration/import 整包校验后导入：为各定义集"
+        "生成新本地标识、迁移别名指向并返回旧→新标识映射。"
     ),
     lifespan=lifespan,
 )
@@ -197,6 +204,60 @@ def bind_unit_set_alias_endpoint(
         alias, req.custom_unit_set_id, req.expected_id
     )
     return UnitSetAliasInfo(alias=alias, custom_unit_set_id=target)
+
+
+@app.post(
+    "/custom-unit-set-migration/export",
+    response_model=UnitSetMigrationPackage,
+    responses={422: {"model": ErrorResponse, "description": "标识不存在、重复或数量越界，未导出"}},
+    summary="导出定义集迁移包（1～6 个定义集及指向它们的活动别名）",
+)
+def export_unit_set_migration_endpoint(
+    req: UnitSetMigrationExportRequest,
+) -> UnitSetMigrationPackage:
+    # 定义集存在性校验与别名筛选在存储层同一把锁内的同一份快照完成：
+    # 并发切换别名时，包内定义与指向必然相互吻合，不会跨快照拼装。
+    sets, aliases = get_store().export_package(list(req.custom_unit_set_ids))
+    return UnitSetMigrationPackage(
+        sets={
+            set_id: list(items)
+            for set_id, items in sets.items()
+        },
+        aliases=aliases,
+    )
+
+
+@app.post(
+    "/custom-unit-set-migration/import",
+    response_model=UnitSetMigrationImportResponse,
+    status_code=201,
+    responses={
+        422: {
+            "model": ErrorResponse,
+            "description": "包内定义非法、别名引用悬空、别名非法或目标端已有"
+            "同名别名：整包拒绝，不留下部分定义或别名",
+        }
+    },
+    summary="导入定义集迁移包：生成新本地标识并迁移别名指向",
+)
+def import_unit_set_migration_endpoint(
+    package: UnitSetMigrationPackage,
+) -> UnitSetMigrationImportResponse:
+    # 先按发布时完全相同的规则校验包内全部定义，再校验别名引用完整性与
+    # 目标端同名冲突；任一失败整包拒绝。通过后新标识生成、别名指向与原子
+    # 落盘在同一临界区共同生效，写盘失败回滚全部新增内容。
+    id_map = get_store().import_package(
+        sets={set_id: list(items) for set_id, items in package.sets.items()},
+        aliases=dict(package.aliases),
+    )
+    return UnitSetMigrationImportResponse(
+        package=package,
+        id_map=id_map,
+        aliases=[
+            UnitSetAliasInfo(alias=alias, custom_unit_set_id=id_map[old_target])
+            for alias, old_target in sorted(package.aliases.items())
+        ],
+    )
 
 
 @app.post(

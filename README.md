@@ -19,6 +19,7 @@
 - **请求级自定义单位**：四个接口（`/convert`、`/evaluate`、`/solve`、`/worksheet`）均可携带 1～6 项 `custom_units`（`symbol`/正十进制 `factor`/`base_unit`，含义为 `1 symbol = factor 个 base_unit`），支持前向引用与链式定义；自定义符号不与内置单位/词头冲突、不自动获得词头、不能引用 `degC`/`degF`/裸 `K`，且仅在本次请求内有效（不修改全局单位表，并发安全）
 - **可复用定义集发布（`POST /custom-unit-sets`）**：把 1～6 项已按上述规则校验并展开的定义发布为**可复用定义集**，服务生成不可猜测的标识；已发布内容不可修改，四个接口可凭 `custom_unit_set_id` 选用（与请求内 `custom_units` 互斥），定义落盘保存，**容器重建后仍可使用**
 - **活动别名（`GET`/`PUT /custom-unit-set-aliases`）**：为已发布的不可变定义集设置一个长期不变的**别名**：调用方始终沿用同一名称，维护者把别名切换到新发布的定义集。切换采用乐观并发（`expected_id`，初建为 `null`）：当前指向不一致返回 **409**、目标不存在返回 **422**，均不改写原指向；别名在请求开始时解析一次（`/worksheet` 整个工作单只解析一次），四个接口可传 `custom_unit_set_alias`（与 `custom_units`、`custom_unit_set_id` 互斥），与定义集共同落盘，**容器重建后仍有效**
+- **定义集迁移包（`POST /custom-unit-set-migration/export`、`/import`）**：通过 HTTP 一次导出 1～6 个已发布定义集及导出时指向它们的活动别名；另一实例整包校验后导入，为各定义集生成**新的本地标识**、把包内别名改指新标识，并返回旧→新标识映射。包内引用悬空、定义非法或目标端已有同名别名时**整包拒绝**，不留下部分定义或别名；导入与落盘共同生效（写盘失败回滚内存状态），导出的定义与指向取自**同一份快照**；原有定义、别名、调用不受影响，新引用容器重建后仍可使用
 - **统一 422**：维度不兼容、未知变量/符号、非法幂、除零、非法仿射用法、非线性方程、零系数、精度溢出均返回 422 且不产出结果
 
 ## 快速开始
@@ -399,6 +400,133 @@ curl -X POST http://localhost:8000/solve \
 - 别名只是不可变定义集之上的一层引用：旧标识含义永不改变，切换别名不影响任何
   直接使用 `custom_unit_set_id` 的调用；不选别名（也不带其他自定义来源）的
   请求行为与以前完全一致。
+
+### 在实例间迁移定义集与别名（导出/导入迁移包）
+
+定义集标识由各实例在发布时随机生成，同一组定义在不同实例上的标识不同。
+迁移包用于把 1～6 个**已发布定义集**连同导出时**指向它们的活动别名**整体搬到
+另一实例：导入端重新校验全部定义、生成**新的本地标识**、把包内别名改指对应
+新标识，并返回旧标识到新标识的映射。整个过程只走 HTTP，包体就是普通 JSON，
+可保存为文件中转。
+
+**第 1 步：在源实例导出**（`POST /custom-unit-set-migration/export`，
+请求体给 1～6 个已发布定义集标识，不可重复）：
+
+```bash
+curl -X POST http://localhost:8000/custom-unit-set-migration/export \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "custom_unit_set_ids": [
+      "cus_82327f8def2025cf00cd703f12b95c8c",
+      "cus_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    ]
+  }'
+```
+
+```json
+{
+  "kind": "unit-api.custom-unit-set-migration",
+  "version": 1,
+  "sets": {
+    "cus_82327f8def2025cf00cd703f12b95c8c": [
+      {"symbol": "furlong", "factor": "10", "base_unit": "chain"},
+      {"symbol": "chain",   "factor": "22", "base_unit": "m"},
+      {"symbol": "ft",      "factor": "0.3048", "base_unit": "m"}
+    ],
+    "cus_a1b2c3d4e5f60718293a4b5c6d7e8f90": [
+      {"symbol": "dozen", "factor": "12", "base_unit": "1"}
+    ]
+  },
+  "aliases": {
+    "lengths":  "cus_82327f8def2025cf00cd703f12b95c8c",
+    "counting": "cus_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+  }
+}
+```
+
+- `sets` 只含被选中的定义集，键为**源实例标识**，内容与发布回显完全一致；
+- `aliases` 只含导出时刻**指向其中任一被选定义集**的活动别名；没有别名指向
+  所选定义集时为 `{}`。定义集存在性检查与别名筛选在服务端**同一临界区的
+  同一份快照**内完成——导出期间即使别名被并发切换，包内别名引用的定义也必然
+  在包内，不会出现“定义来自切换前、指向来自切换后”的跨快照拼装；
+- 标识不存在、重复或数量不在 1～6 个时返回 **422**，不产生包。
+
+可把响应直接保存为文件：
+
+```bash
+curl -sS -X POST http://localhost:8000/custom-unit-set-migration/export \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_unit_set_ids":["cus_82327f8def2025cf00cd703f12b95c8c"]}' \
+  > migration-package.json
+```
+
+**第 2 步：在目标实例导入**（`POST /custom-unit-set-migration/import`，
+请求体即导出响应，可原样提交）：
+
+```bash
+curl -X POST http://localhost:8001/custom-unit-set-migration/import \
+  -H 'Content-Type: application/json' \
+  --data-binary @migration-package.json
+```
+
+```json
+{
+  "package": { "...": "（回显实际导入的包）" },
+  "id_map": {
+    "cus_82327f8def2025cf00cd703f12b95c8c": "cus_f0e1d2c3b4a5968778695a4b3c2d1e0f"
+  },
+  "aliases": [
+    {"alias": "lengths", "custom_unit_set_id": "cus_f0e1d2c3b4a5968778695a4b3c2d1e0f"}
+  ]
+}
+```
+
+- 每个定义集获得目标实例生成的**全新本地标识**（不沿用源标识）；`id_map`
+  给出源标识 → 新标识的对应关系，包内别名自动指向对应的新标识；
+- **整包事务**：以下任一情况整包拒绝（**422**），**不留下任何部分定义或别名**——
+  包内某定义集按发布时完全相同的规则校验失败（重名/与内置单位冲突/循环/
+  未知引用/禁引温标/非法比例等）、包内别名指向了不在包内的标识（悬空引用）、
+  别名名称非法、**目标实例已存在任一同名别名**、`kind`/`version` 不被支持、
+  定义集数量不在 1～6 个；
+- 导入是**纯增量**操作：目标实例原有的定义集、别名与正在进行的调用完全不受
+  影响；同一包可导入到多个实例（各自得到不同的新标识）。同名定义符号允许与
+  目标端已有定义集并存——定义集之间相互独立，符号含义只在单次调用的上下文内
+  生效；
+- 新标识生成、别名改指与 JSON 原子落盘在同一临界区内**共同生效**：写盘失败
+  会回滚全部新增的定义集与别名，内存状态也保持导入前原样；导入内容与原有内容
+  写入同一个 `custom_unit_sets.json`，命名卷挂载方式不变，**容器重建/进程重启
+  后迁移来的定义集与新引用仍然可用**。
+
+**第 3 步：在目标实例按别名（或新标识）调用**，用法与源实例完全相同：
+
+```bash
+# 按迁移来的活动别名调用——调用方请求体无需改变
+curl -X POST http://localhost:8001/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"2","from":"furlong","to":"m","custom_unit_set_alias":"lengths"}'
+# {"value":"440","unit":"m","dimension":"m"}
+
+# 也可直接用 id_map 中的新标识
+curl -X POST http://localhost:8001/convert \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "value":"2","from":"furlong","to":"m",
+    "custom_unit_set_id":"cus_f0e1d2c3b4a5968778695a4b3c2d1e0f"
+  }'
+# {"value":"440","unit":"m","dimension":"m"}
+```
+
+> **在本机演示两个实例**：Compose 的容器端口与数据目录均可用环境变量覆盖，
+> 再起一个实例监听 8001、使用独立命名卷即可：
+>
+> ```bash
+> docker compose up --build -d                  # 源实例：localhost:8000
+> UNIT_API_PORT=8001 \
+>   docker compose -p unitapi-dst up --build -d  # 目标实例：localhost:8001
+> ```
+>
+> 不同的 Compose 项目名（`-p unitapi-dst`）会自动使用独立的命名卷，
+> 两个实例的已发布定义集互不可见——这正是迁移包的典型使用场景。
 
 ### `POST /evaluate`
 
@@ -893,6 +1021,8 @@ curl -X POST http://localhost:8000/worksheet \
 | `GET /custom-unit-set-aliases` | 列出全部活动别名及其当前指向的定义集标识 |
 | `GET /custom-unit-set-aliases/{alias}` | 查询单个活动别名当前指向（不存在返回 422） |
 | `PUT /custom-unit-set-aliases/{alias}` | 创建/切换活动别名（乐观并发：`expected_id` 初建为 `null`）；成功 200，冲突 409，目标不存在 422 |
+| `POST /custom-unit-set-migration/export` | 导出 1～6 个已发布定义集及指向它们的活动别名（同一快照）为迁移包 JSON；标识不存在/重复/越界 422 |
+| `POST /custom-unit-set-migration/import` | 导入迁移包（201）：整包校验通过后生成新本地标识、别名改指新标识，返回旧→新标识映射；定义非法/引用悬空/同名别名冲突整包 422 拒绝，不留部分内容 |
 | `GET /units` | 列出全部单位、词头与别名         |
 | `GET /health`| 健康检查                         |
 | `GET /`      | 服务信息                         |
@@ -966,7 +1096,7 @@ PRIMARY:= "(" expr ")" | VARIABLE | DECIMAL
 
 | 错误码               | 含义                                   |
 | -------------------- | -------------------------------------- |
-| `invalid_request`    | 请求参数校验失败（缺字段、值非法等；自定义单位的重名/符号冲突/循环引用/非法比例/禁引温标，以及 `custom_units`、`custom_unit_set_id`、`custom_unit_set_alias` 任意两个同时出现、引用的定义集标识或活动别名不存在、别名绑定的目标定义集不存在也归入此码）   |
+| `invalid_request`    | 请求参数校验失败（缺字段、值非法等；自定义单位的重名/符号冲突/循环引用/非法比例/禁引温标，以及 `custom_units`、`custom_unit_set_id`、`custom_unit_set_alias` 任意两个同时出现、引用的定义集标识或活动别名不存在、别名绑定的目标定义集不存在，以及迁移包导出标识不存在/重复/越界、导入时包内别名悬空或别名非法/目标端已有同名别名/包格式不支持也归入此码）   |
 | `invalid_syntax`     | 表达式/公式语法错误（含隐式相乘）      |
 | `unknown_symbol`     | 未知单位符号（含自定义单位的 `base_unit` 引用了未声明符号） |
 | `unknown_variable`   | 公式引用了未在变量映射中提供的变量     |
@@ -1009,7 +1139,7 @@ app/
   migrate.py    # 工作单输入迁移：旧定义下执行后把初始变量改写为新定义下物理量相同的精确十进制值，复核整张新工作单并返回可直接交给 /worksheet 的结果
   units.py      # 单位注册表、SI 词头与别名
   custom_units.py  # 请求级自定义单位（custom_units）：冲突/循环/禁引校验与链式解析，三种来源选择
-  unit_sets.py  # 已发布定义集与活动别名：校验发布、标识生成、别名乐观切换（CAS）、线程安全与 JSON 落盘/重载
+  unit_sets.py  # 已发布定义集与活动别名：校验发布、标识生成、别名乐观切换（CAS）、迁移包导出（同快照）/整包导入（新标识+别名改指+共同落盘）、线程安全与 JSON 落盘/重载
   converter.py  # 量纲校验、仿射规则与精确十进制换算
   errors.py     # 领域错误（换算类统一映射 422；别名冲突 AliasConflictError 映射 409）
   config.py     # 精度/幂次上限/数据目录配置

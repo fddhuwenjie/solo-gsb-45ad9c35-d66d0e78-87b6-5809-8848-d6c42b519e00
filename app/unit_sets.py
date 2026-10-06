@@ -17,6 +17,15 @@
 - 别名与定义集保存在同一个 JSON 文件中，容器重建/进程重启后仍然有效；
   旧文件没有别名字段时按空别名加载，已发布定义集照常可用。
 
+此外，``POST /custom-unit-set-migration/export`` 可一次导出指定的 1～6 个
+已发布定义集，以及导出时刻**指向这些定义集的活动别名**，组成可经 HTTP
+传递的迁移包；另一实例用 ``POST /custom-unit-set-migration/import`` 导入：
+定义与别名引用先按现有规则整包校验（定义非法、包内引用悬空或目标端已有
+同名别名都整包拒绝），通过后为各定义集生成新的本地标识、把包内别名改指
+新标识，并返回旧标识到新标识的映射。导出的定义与指向取自同一把锁内的
+同一份快照（并发切换别名不会跨快照拼装）；导入与落盘共同生效，写盘失败
+时回滚全部新增内容，原有定义、别名与调用保持可用。
+
 设计要点：
 
 - 发布前先用 :class:`~app.custom_units.UnitScope` 完整校验并展开全部条目
@@ -97,6 +106,50 @@ def invalid_alias_name(alias: str) -> ConversionError:
         "invalid_request",
         f"别名 {alias!r} 不合法：仅允许字母、数字、下划线与连字符，"
         "长度 1～64",
+    )
+
+
+def export_empty_selection() -> ConversionError:
+    """导出请求未指定任何定义集标识（HTTP 422）。"""
+
+    return ConversionError(
+        "invalid_request", "导出包必须指定 1～6 个已发布定义集标识"
+    )
+
+
+def export_duplicate_selection(set_id: str) -> ConversionError:
+    """导出请求中同一标识重复出现（HTTP 422）。"""
+
+    return ConversionError(
+        "invalid_request", f"导出包中定义集标识重复: {set_id!r}"
+    )
+
+
+def package_empty() -> ConversionError:
+    """迁移包不包含任何定义集（HTTP 422）。"""
+
+    return ConversionError(
+        "invalid_request", "迁移包不包含任何定义集：至少需要 1 个定义集"
+    )
+
+
+def package_dangling_alias(alias: str, set_id: str) -> ConversionError:
+    """包内别名指向了不在包内的定义集（悬空引用，HTTP 422）。"""
+
+    return ConversionError(
+        "invalid_request",
+        f"迁移包内别名 {alias!r} 指向的定义集 {set_id!r} 不在包内"
+        "（包内引用不得悬空）",
+    )
+
+
+def package_alias_conflict(alias: str) -> ConversionError:
+    """目标实例已存在同名别名：整包拒绝（HTTP 422）。"""
+
+    return ConversionError(
+        "invalid_request",
+        f"目标实例已存在同名活动别名 {alias!r}：整包拒绝导入，"
+        "不写入任何定义集或别名",
     )
 
 
@@ -286,6 +339,135 @@ class UnitSetStore:
         self._ensure_loaded()
         with self._lock:
             return len(self._sets)
+
+    # -- 实例间迁移包 -----------------------------------------------------
+
+    def export_package(
+        self, set_ids: list[str]
+    ) -> tuple[dict[str, tuple[CustomUnitItem, ...]], dict[str, str]]:
+        """在同一把锁的同一份快照上导出指定定义集与指向它们的活动别名。
+
+        返回 ``(sets, aliases)``：``sets`` 仅含被选中的定义集（按
+        ``set_ids`` 的提交顺序、去重后排列）；``aliases`` 仅含导出时刻
+        **指向其中任一被选定义集**的活动别名（按别名排序）。定义集不可变，
+        但别名指向可并发切换：选择存在性校验与别名筛选都在同一临界区内
+        完成，因此包内别名引用的定义必然也在包内，不会因并发切换出现
+        “定义来自切换前、指向来自切换后”的跨快照拼装。
+
+        - 列表为空或超过 6 个标识、标识重复：抛出 422；
+        - 任一标识不存在：抛出 422，不导出任何内容。
+        """
+
+        self._ensure_loaded()
+        if not set_ids:
+            raise export_empty_selection()
+        if len(set_ids) > 6:
+            raise invalid_request("一次最多导出 6 个定义集")
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for set_id in set_ids:
+            if set_id in seen:
+                raise export_duplicate_selection(set_id)
+            seen.add(set_id)
+            ordered.append(set_id)
+        with self._lock:
+            for set_id in ordered:
+                if set_id not in self._sets:
+                    raise unit_set_not_found(set_id)
+            selected = set(ordered)
+            sets = {set_id: self._sets[set_id] for set_id in ordered}
+            aliases = {
+                alias: target
+                for alias, target in sorted(self._aliases.items())
+                if target in selected
+            }
+        return sets, aliases
+
+    def import_package(
+        self,
+        sets: dict[str, list[CustomUnitItem]],
+        aliases: dict[str, str],
+    ) -> dict[str, str]:
+        """导入另一实例导出的迁移包：全部校验通过后共同生效，返回旧→新标识映射。
+
+        导入为**整包事务**，任一环节失败都抛出 422 且不留下部分定义或别名：
+
+        1. 包内至少含 1 个定义集、至多 6 个；
+        2. 每个定义集按发布时完全相同的规则用 :class:`UnitScope` 校验并展开
+           （重名/冲突/循环/未知引用/禁引温标/非法比例均拒绝）；
+        3. 每个别名名称合法，且指向的标识必须在包内（悬空引用整包拒绝）；
+        4. 目标实例不得已存在任一同名别名（已存在则整包拒绝）。
+
+        全部通过后，在同一把锁内为各定义集生成新的本地标识、把包内别名
+        指向对应的新标识，再原子落盘：导入与落盘共同生效，写盘失败时
+        回滚全部新增的定义集与别名，原有定义、别名与正在进行的调用不受
+        影响。导入是纯增量操作：不覆盖、不删除目标实例原有的任何内容。
+
+        返回 ``{包内旧标识: 目标实例新标识}``（按旧标识排序，便于核对）。
+        """
+
+        self._ensure_loaded()
+        if not sets:
+            raise package_empty()
+        if len(sets) > 6:
+            raise invalid_request("一个迁移包最多包含 6 个定义集")
+
+        # 锁外先做与目标实例当前状态无关的校验：定义合法性（UnitScope 构造
+        # 是纯函数式操作，不触碰全局单位表）与包内别名引用完整性。
+        validated: dict[str, tuple[CustomUnitItem, ...]] = {}
+        for old_id, items in sets.items():
+            specs = [
+                CustomUnitSpec(
+                    symbol=item.symbol,
+                    factor=Fraction(item.factor),
+                    base_unit=item.base_unit,
+                )
+                for item in items
+            ]
+            # 与发布完全相同的校验：非法即抛 422，发生在任何写入之前
+            UnitScope(specs)
+            validated[old_id] = tuple(items)
+        for alias, target in aliases.items():
+            if not ALIAS_NAME_RE.match(alias):
+                raise invalid_alias_name(alias)
+            if target not in validated:
+                raise package_dangling_alias(alias, target)
+
+        with self._lock:
+            # 同名别名冲突在锁内判定：整包拒绝，不写入任何内容
+            for alias in aliases:
+                if alias in self._aliases:
+                    raise package_alias_conflict(alias)
+
+            # 为每个旧标识生成目标实例的新本地标识
+            id_map: dict[str, str] = {}
+            for old_id in validated:
+                while True:
+                    new_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
+                    if new_id not in self._sets and new_id not in id_map.values():
+                        break
+                id_map[old_id] = new_id
+
+            added_sets: dict[str, tuple[CustomUnitItem, ...]] = {}
+            added_aliases: dict[str, str] = {}
+            for old_id, items in validated.items():
+                added_sets[id_map[old_id]] = items
+            for alias, old_target in aliases.items():
+                added_aliases[alias] = id_map[old_target]
+
+            self._sets.update(added_sets)
+            self._aliases.update(added_aliases)
+            try:
+                self._persist_locked()
+            except Exception:
+                # 写盘失败：回滚全部新增内容，导入与落盘必须共同生效；
+                # 原有定义集与别名（键在导入前已存在）保持原样
+                for new_id in added_sets:
+                    del self._sets[new_id]
+                for alias in added_aliases:
+                    del self._aliases[alias]
+                raise
+        return dict(sorted(id_map.items()))
 
     # -- 内部 -------------------------------------------------------------
 

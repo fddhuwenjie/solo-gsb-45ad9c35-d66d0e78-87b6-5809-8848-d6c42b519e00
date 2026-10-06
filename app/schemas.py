@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import MAX_PRECISION
+
+#: 定义集标识的长度约束（与既有字段保持一致）。
+SetId = Annotated[str, Field(min_length=1, max_length=64)]
 
 
 def _coerce_value(v: Any) -> Any:
@@ -600,6 +603,123 @@ class UnitSetAliasListResponse(BaseModel):
 
     aliases: list[UnitSetAliasInfo] = Field(
         description="全部活动别名及其当前指向（按别名排序）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 定义集迁移包（POST /custom-unit-set-migration/export|import）
+# ---------------------------------------------------------------------------
+
+#: 迁移包格式标识与版本（未知格式/版本在导入端整包拒绝为 422）。
+MIGRATION_PACKAGE_FORMAT = "custom-unit-set-migration"
+MIGRATION_PACKAGE_VERSION = 1
+
+
+class ExportUnitSetsRequest(BaseModel):
+    """``POST /custom-unit-set-migration/export`` 请求体。"""
+
+    custom_unit_set_ids: list[SetId] = Field(
+        min_length=1,
+        max_length=6,
+        description="待导出的已发布定义集标识（1～6 个，不可重复）；"
+        "任一标识不存在整次导出返回 422",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique(self) -> "ExportUnitSetsRequest":
+        if len(set(self.custom_unit_set_ids)) != len(self.custom_unit_set_ids):
+            raise ValueError("custom_unit_set_ids 不得包含重复的定义集标识")
+        return self
+
+
+class MigrationUnitSet(BaseModel):
+    """迁移包内的单个定义集：源实例标识 + 已按发布规则校验通过的定义项。"""
+
+    id: SetId = Field(description="源实例中的定义集标识（导入端会生成新的本地标识）")
+    custom_units: list[CustomUnitItem] = Field(
+        min_length=1,
+        max_length=6,
+        description="已发布的定义项（1～6 项，与 /custom-unit-sets 的条目格式一致）",
+    )
+
+
+class MigrationAlias(BaseModel):
+    """迁移包内的单个活动别名：别名 + 导出时在快照中指向的定义集标识。"""
+
+    alias: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=ALIAS_NAME_PATTERN,
+        description="活动别名（与 PUT /custom-unit-set-aliases 的别名词法一致）",
+    )
+    custom_unit_set_id: SetId = Field(
+        description="导出快照中该别名指向的定义集标识；必须是包内定义集之一"
+    )
+
+
+class UnitSetMigrationPackage(BaseModel):
+    """实例间迁移包：定义集 + 导出时指向这些定义集的活动别名（同一份快照）。"""
+
+    format: str = Field(description="迁移包格式标识；导入端不识别时整包拒绝为 422")
+    version: int = Field(description="迁移包格式版本；导入端不支持时整包拒绝为 422")
+    custom_unit_sets: list[MigrationUnitSet] = Field(
+        min_length=1,
+        max_length=6,
+        description="导出的已发布定义集（1～6 个，标识在包内唯一）",
+    )
+    aliases: list[MigrationAlias] = Field(
+        description="导出时指向上述定义集的全部活动别名（包内无重复别名，"
+        "且每个别名的指向必须是包内定义集标识之一）",
+    )
+
+    @model_validator(mode="after")
+    def _check_package_integrity(self) -> "UnitSetMigrationPackage":
+        set_ids = [item.id for item in self.custom_unit_sets]
+        if len(set(set_ids)) != len(set_ids):
+            raise ValueError("迁移包内的定义集标识不得重复")
+        known = set(set_ids)
+        alias_names = [item.alias for item in self.aliases]
+        if len(set(alias_names)) != len(alias_names):
+            raise ValueError("迁移包内的别名不得重复")
+        dangling = [item.custom_unit_set_id for item in self.aliases if item.custom_unit_set_id not in known]
+        if dangling:
+            raise ValueError(
+                "迁移包存在悬空别名引用：别名指向的定义集标识不在包内: "
+                + ", ".join(sorted(set(dangling)))
+            )
+        return self
+
+
+class ImportedUnitSetInfo(BaseModel):
+    """单个定义集的导入结果：源标识到新本地标识的映射与回显。"""
+
+    old_id: str = Field(description="迁移包内的源实例定义集标识")
+    new_id: str = Field(description="导入端为该定义集生成的新本地标识（不可猜测）")
+    custom_units: list[PublishedCustomUnitItem] = Field(
+        description="已导入的定义项（factor 回显为精确十进制字符串），顺序与包内一致"
+    )
+
+
+class ImportedAliasInfo(BaseModel):
+    """单个别名的导入结果。"""
+
+    alias: str = Field(description="活动别名")
+    custom_unit_set_id: str = Field(
+        description="别名在导入端指向的新本地定义集标识（由包内旧标识映射而来）"
+    )
+
+
+class ImportUnitSetsResponse(BaseModel):
+    """``POST /custom-unit-set-migration/import`` 的成功响应（201）。"""
+
+    custom_unit_sets: list[ImportedUnitSetInfo] = Field(
+        description="导入的定义集及旧标识 -> 新本地标识的映射（顺序与迁移包一致）"
+    )
+    aliases: list[ImportedAliasInfo] = Field(
+        description="导入的活动别名及其指向的新本地标识（按别名排序）"
+    )
+    id_map: dict[str, str] = Field(
+        description="旧标识（源实例）到新本地标识的映射，便于调用方改写引用"
     )
 
 

@@ -100,6 +100,16 @@ def invalid_alias_name(alias: str) -> ConversionError:
     )
 
 
+def import_alias_exists(alias: str) -> ConversionError:
+    """导入包中的别名在目标端已存在：整包拒绝（HTTP 422，不覆盖既有别名）。"""
+
+    return ConversionError(
+        "invalid_request",
+        f"迁移包中的别名 {alias!r} 在目标实例已存在：为避免覆盖既有指向，"
+        "整包拒绝导入，请先在源端或目标端处理该别名后重试",
+    )
+
+
 class UnitSetStore:
     """已发布定义集与活动别名的持久化存储（线程安全、原子落盘）。"""
 
@@ -279,6 +289,125 @@ class UnitSetStore:
         """
 
         return self.build_scope(self.get_alias(alias))
+
+    # -- 实例间迁移：导出 / 导入 -----------------------------------------
+
+    def export_snapshot(
+        self, set_ids: list[str]
+    ) -> tuple[
+        list[tuple[str, tuple[CustomUnitItem, ...]]], list[tuple[str, str]]
+    ]:
+        """在**同一份快照**中取出指定定义集与当时指向它们的活动别名。
+
+        整个读取过程在同一把锁内完成：即使别名在导出请求处理期间被并发
+        切换，包内的定义与别名指向也必然来自同一个一致状态，不可能出现
+        “定义来自切换前、指向来自切换后”的混版包。任一标识不存在时抛出
+        422 且不返回任何内容。
+
+        返回 ``(sets, aliases)``：``sets`` 为按请求顺序排列的
+        ``(标识, 定义项元组)``；``aliases`` 为按别名排序的
+        ``(别名, 指向标识)``，仅包含指向被导出定义集的活动别名。
+        """
+
+        self._ensure_loaded()
+        with self._lock:
+            sets: list[tuple[str, tuple[CustomUnitItem, ...]]] = []
+            for set_id in set_ids:
+                items = self._sets.get(set_id)
+                if items is None:
+                    raise unit_set_not_found(set_id)
+                sets.append((set_id, tuple(items)))
+            wanted = set(set_ids)
+            aliases = sorted(
+                (name, target)
+                for name, target in self._aliases.items()
+                if target in wanted
+            )
+        return sets, aliases
+
+    def import_package(
+        self,
+        sets: list[tuple[str, tuple[CustomUnitItem, ...]]],
+        aliases: list[tuple[str, str]],
+    ) -> tuple[dict[str, str], list[tuple[str, str]]]:
+        """导入迁移包：为各定义集生成新本地标识，别名指向映射后的新标识。
+
+        导入前先按现有规则完整校验：
+
+        - 每个定义集都经过与发布完全相同的校验与展开（重名/冲突/循环/
+          未知引用/禁引温标/非法比例等任一不合法即拒绝）；
+        - 包内别名引用必须落在包内定义集上（悬空引用拒绝；schema 层
+          先行校验，这里对编程式调用同样兜底）；
+        - 包内任一名别名已存在于目标端（无论指向什么）即拒绝，**不覆盖**
+          目标端既有别名。
+
+        全部校验通过后才在同一临界区内：生成新标识、加入定义、重定向
+        别名并**原子写盘一次**。任何写盘失败都会回滚内存中的全部改动
+        （新增的定义集与别名一并移除），进程内状态与磁盘都保持导入前
+        原样，不留下部分定义或别名。目标端已有**同名定义集标识**不冲突：
+        导入始终生成新标识，原有定义集不受影响。
+
+        返回 ``(id_map, imported_aliases)``：``id_map`` 为旧标识 -> 新
+        本地标识的映射；``imported_aliases`` 为按别名排序的
+        ``(别名, 新指向标识)``。
+        """
+
+        self._ensure_loaded()
+        # 1) 锁外（且先于任何写入）按现有规则校验并展开每个定义集——
+        #    纯计算，不触碰共享存储状态。
+        for old_id, items in sets:
+            specs = [
+                CustomUnitSpec(
+                    symbol=item.symbol,
+                    factor=Fraction(item.factor),
+                    base_unit=item.base_unit,
+                )
+                for item in items
+            ]
+            UnitScope(specs)
+
+        with self._lock:
+            known_old = {old_id for old_id, _ in sets}
+            # 2) 别名悬空引用兜底（schema 解析的请求已保证，防御编程式调用）
+            for alias, target in aliases:
+                if target not in known_old:
+                    raise invalid_request(
+                        f"迁移包存在悬空别名引用：别名 {alias!r} 指向的定义集 "
+                        f"标识 {target!r} 不在包内"
+                    )
+            # 3) 目标端已有同名别名：整包拒绝（不覆盖既有指向）
+            for alias, _ in aliases:
+                if alias in self._aliases:
+                    raise import_alias_exists(alias)
+
+            # 4) 全部校验通过：生成新标识并重定向别名，单次原子写盘共同生效
+            id_map: dict[str, str] = {}
+            added_sets: list[str] = []
+            added_aliases: list[str] = []
+            for old_id, items in sets:
+                while True:
+                    new_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
+                    if new_id not in self._sets and new_id not in id_map.values():
+                        break
+                self._sets[new_id] = tuple(items)
+                added_sets.append(new_id)
+                id_map[old_id] = new_id
+            try:
+                for alias, old_target in aliases:
+                    self._aliases[alias] = id_map[old_target]
+                    added_aliases.append(alias)
+                self._persist_locked()
+            except Exception:
+                # 写盘失败：内存状态也必须保持导入前原样，不留部分定义或别名
+                for alias in added_aliases:
+                    self._aliases.pop(alias, None)
+                for new_id in added_sets:
+                    self._sets.pop(new_id, None)
+                raise
+        imported_aliases = sorted(
+            (alias, id_map[old_target]) for alias, old_target in aliases
+        )
+        return id_map, imported_aliases
 
     def count(self) -> int:
         """已发布的定义集数量（主要供测试与运维观察）。"""

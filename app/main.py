@@ -28,11 +28,21 @@ from .schemas import (
     ConvertResponse,
     ErrorResponse,
     EvaluateRequest,
+    ExportUnitSetsRequest,
+    ImportUnitSetsResponse,
+    ImportedAliasInfo,
+    ImportedUnitSetInfo,
+    MIGRATION_PACKAGE_FORMAT,
+    MIGRATION_PACKAGE_VERSION,
+    MigrationAlias,
+    MigrationUnitSet,
     PublishUnitSetRequest,
+    PublishedCustomUnitItem,
     PublishedUnitSetResponse,
     SolveRequest,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
+    UnitSetMigrationPackage,
     WorksheetDiagnoseRequest,
     WorksheetDiagnoseResponse,
     WorksheetMigrateRequest,
@@ -41,7 +51,7 @@ from .schemas import (
     WorksheetResponse,
 )
 from .solver import solve
-from .unit_sets import get_store
+from .unit_sets import get_store, invalid_request
 from .units import ALIASES, PREFIXES, REGISTRY
 from .worksheet import run_worksheet
 
@@ -71,6 +81,10 @@ app = FastAPI(
         "物理量相同的精确十进制值，返回可直接交给 /worksheet 的新工作单。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
         "再由四个接口凭标识选用。"
+        "POST /custom-unit-set-migration/export 可从同一份快照导出 1～6 个"
+        "已发布定义集及指向它们的活动别名；"
+        "POST /custom-unit-set-migration/import 在另一实例为其生成新本地"
+        "标识、重定向别名并返回旧标识到新标识的映射（非法或冲突整包拒绝）。"
     ),
     lifespan=lifespan,
 )
@@ -197,6 +211,98 @@ def bind_unit_set_alias_endpoint(
         alias, req.custom_unit_set_id, req.expected_id
     )
     return UnitSetAliasInfo(alias=alias, custom_unit_set_id=target)
+
+
+@app.post(
+    "/custom-unit-set-migration/export",
+    response_model=UnitSetMigrationPackage,
+    responses={422: {"model": ErrorResponse, "description": "标识不存在/为空/超过 6 个/重复"}},
+    summary="导出定义集迁移包（1～6 个已发布定义集及当时指向它们的活动别名）",
+)
+def export_unit_set_migration_endpoint(
+    req: ExportUnitSetsRequest,
+) -> UnitSetMigrationPackage:
+    # 在同一份快照（同一把锁）中取出指定定义集与当时指向它们的活动别名：
+    # 并发切换别名时，包内定义与指向必然来自同一个一致状态。
+    store = get_store()
+    snapshot_sets, snapshot_aliases = store.export_snapshot(req.custom_unit_set_ids)
+    return UnitSetMigrationPackage(
+        format=MIGRATION_PACKAGE_FORMAT,
+        version=MIGRATION_PACKAGE_VERSION,
+        custom_unit_sets=[
+            MigrationUnitSet(
+                id=set_id,
+                custom_units=list(items),
+            )
+            for set_id, items in snapshot_sets
+        ],
+        aliases=[
+            MigrationAlias(alias=alias, custom_unit_set_id=target)
+            for alias, target in snapshot_aliases
+        ],
+    )
+
+
+@app.post(
+    "/custom-unit-set-migration/import",
+    response_model=ImportUnitSetsResponse,
+    status_code=201,
+    responses={
+        422: {
+            "model": ErrorResponse,
+            "description": "迁移包格式/版本不支持、包内引用悬空、定义非法，"
+            "或目标端已有同名别名：整包拒绝，不留下部分定义或别名",
+        }
+    },
+    summary="导入定义集迁移包：生成新本地标识、重定向别名并返回旧标识映射",
+)
+def import_unit_set_migration_endpoint(
+    package: UnitSetMigrationPackage,
+) -> ImportUnitSetsResponse:
+    # 格式/版本不支持：整包拒绝（包内完整性：标识/别名唯一、引用不悬空已由
+    # schema 校验）。随后按现有发布规则逐个校验展开全部定义；目标端已有
+    # 同名别名也整包拒绝。校验全部通过后才在同一临界区生成新标识、重定向
+    # 别名并原子写盘——写盘失败回滚全部内存改动，不留部分定义或别名。
+    if (
+        package.format != MIGRATION_PACKAGE_FORMAT
+        or package.version != MIGRATION_PACKAGE_VERSION
+    ):
+        raise invalid_request(
+            f"不支持的迁移包格式/版本：format={package.format!r}, "
+            f"version={package.version!r}；期望 format="
+            f"{MIGRATION_PACKAGE_FORMAT!r}, version={MIGRATION_PACKAGE_VERSION}"
+        )
+
+    store = get_store()
+    id_map, imported_aliases = store.import_package(
+        [
+            (item.id, tuple(item.custom_units))
+            for item in package.custom_unit_sets
+        ],
+        [(item.alias, item.custom_unit_set_id) for item in package.aliases],
+    )
+    return ImportUnitSetsResponse(
+        custom_unit_sets=[
+            ImportedUnitSetInfo(
+                old_id=item.id,
+                new_id=id_map[item.id],
+                custom_units=[
+                    PublishedCustomUnitItem(
+                        symbol=unit.symbol,
+                        factor=str(unit.factor),
+                        base_unit=unit.base_unit,
+                    )
+                    for unit in item.custom_units
+                ],
+            )
+            for item in package.custom_unit_sets
+        ],
+        aliases=[
+            ImportedAliasInfo(alias=alias, custom_unit_set_id=new_target)
+            for alias, new_target in imported_aliases
+        ],
+        id_map=id_map,
+    )
 
 
 @app.post(
